@@ -1,4 +1,4 @@
-import { randomUUID } from "crypto";
+import { createHash, randomUUID } from "crypto";
 
 import {
   ForbiddenError,
@@ -208,6 +208,12 @@ type NanoTimestamp =
 
 type TimestampField = "start_time" | "end_time" | "unknown";
 
+type OtelId =
+  | string
+  | Buffer
+  | number[]
+  | { type?: "Buffer"; data?: Buffer | number[] };
+
 export interface ResourceSpan {
   resource?: {
     attributes?: Array<{ key: string; value: any }>;
@@ -219,9 +225,9 @@ export interface ResourceSpan {
       attributes?: Array<{ key: string; value: any }>;
     };
     spans?: Array<{
-      traceId: { data?: Buffer } | Buffer;
-      spanId: { data?: Buffer } | Buffer;
-      parentSpanId?: { data?: Buffer } | Buffer;
+      traceId: OtelId;
+      spanId: OtelId;
+      parentSpanId?: OtelId;
       name: string;
       kind: number;
       startTimeUnixNano?: NanoTimestamp;
@@ -234,6 +240,26 @@ export interface ResourceSpan {
 }
 
 const observationTypeMapper = new ObservationTypeMapperRegistry();
+
+const CODEX_TURN_ID_ATTRIBUTE = `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.codex.turn_id`;
+const CODEX_THREAD_ID_ATTRIBUTE = `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.codex.thread_id`;
+const CODEX_STEP_INDEX_ATTRIBUTE = `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.codex.step_index`;
+const CODEX_CALL_ID_ATTRIBUTE = `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.codex.call_id`;
+const CODEX_TRACE_SEED_PARENT_SPAN_ID = "0123456789abcdef";
+const CODEX_TURN_SPAN_NAMES = new Set(["Codex Turn", "Codex Subagent Turn"]);
+
+interface CodexSpanIdentity {
+  span: NonNullable<
+    NonNullable<ResourceSpan["scopeSpans"]>[number]["spans"]
+  >[number];
+  traceId: string;
+  spanId: string;
+  parentSpanId: string | null;
+  turnId?: string;
+  threadId?: string;
+  stepIndex?: string;
+  callId?: string;
+}
 
 /**
  * Processor class that encapsulates all logic for converting OpenTelemetry
@@ -320,6 +346,229 @@ export class OtelIngestionProcessor {
   }
 
   /**
+   * Codex observability plugin v0.1.0 can upload the same turn twice when a
+   * Stop hook runs once before and once after Codex writes `task_complete`.
+   * Those uploads keep the semantic Codex ids but regenerate every OTEL id.
+   *
+   * Normalize Langfuse JavaScript SDK spans carrying the Codex metadata
+   * contract, including Collector-forwarded traffic whose originating SDK
+   * header is no longer present. ClickHouse's ReplacingMergeTree can then
+   * converge the repeated upload onto one trace and one set of observations. A
+   * trace id explicitly pinned through the plugin's `trace_seed` option is
+   * preserved.
+   */
+  private normalizeCodexSpanIds(resourceSpans: ResourceSpan[]): void {
+    if (this.sdkName !== "javascript" && this.sdkName !== "unknown") return;
+
+    const spansByTraceId = new Map<string, CodexSpanIdentity[]>();
+
+    for (const resourceSpan of resourceSpans) {
+      for (const scopeSpan of resourceSpan.scopeSpans ?? []) {
+        if (!scopeSpan.scope?.name?.startsWith("langfuse-sdk")) continue;
+
+        for (const span of scopeSpan.spans ?? []) {
+          const traceId = this.tryParseOtelId(span.traceId);
+          const spanId = this.tryParseOtelId(span.spanId);
+          if (!traceId || !spanId) continue;
+
+          const isCodexTurn = CODEX_TURN_SPAN_NAMES.has(span.name);
+          const turnId = isCodexTurn
+            ? this.extractCodexIdentityAttribute(span, CODEX_TURN_ID_ATTRIBUTE)
+            : undefined;
+          const threadId = isCodexTurn
+            ? this.extractCodexIdentityAttribute(
+                span,
+                CODEX_THREAD_ID_ATTRIBUTE,
+              )
+            : undefined;
+
+          const identity: CodexSpanIdentity = {
+            span,
+            traceId,
+            spanId,
+            parentSpanId: span.parentSpanId
+              ? (this.tryParseOtelId(span.parentSpanId) ?? null)
+              : null,
+            turnId,
+            threadId,
+            stepIndex: this.extractCodexIdentityAttribute(
+              span,
+              CODEX_STEP_INDEX_ATTRIBUTE,
+            ),
+            callId: this.extractCodexIdentityAttribute(
+              span,
+              CODEX_CALL_ID_ATTRIBUTE,
+            ),
+          };
+
+          const traceSpans = spansByTraceId.get(traceId) ?? [];
+          traceSpans.push(identity);
+          spansByTraceId.set(traceId, traceSpans);
+        }
+      }
+    }
+
+    for (const traceSpans of spansByTraceId.values()) {
+      const spansById = new Map(
+        traceSpans.map((identity) => [identity.spanId, identity]),
+      );
+      const topLevelTurn = traceSpans.find(
+        (identity) =>
+          identity.turnId &&
+          identity.threadId &&
+          (!identity.parentSpanId || !spansById.has(identity.parentSpanId)),
+      );
+      if (!topLevelTurn?.turnId || !topLevelTurn.threadId) continue;
+
+      const topLevelTurnKey = this.codexTurnKey(
+        topLevelTurn.threadId,
+        topLevelTurn.turnId,
+      );
+      const traceId =
+        topLevelTurn.parentSpanId === CODEX_TRACE_SEED_PARENT_SPAN_ID
+          ? Buffer.from(topLevelTurn.traceId, "hex")
+          : this.createStableCodexId(16, "trace", topLevelTurnKey);
+
+      const stableSpanIds = new Map<string, Buffer>();
+      for (const identity of traceSpans) {
+        const owningTurn = this.findOwningCodexTurn(identity, spansById);
+        if (!owningTurn?.turnId || !owningTurn.threadId) continue;
+
+        const owningTurnKey = this.codexTurnKey(
+          owningTurn.threadId,
+          owningTurn.turnId,
+        );
+        let semanticSpanKey: string | undefined;
+
+        if (identity === owningTurn) {
+          semanticSpanKey = `turn:${owningTurnKey}`;
+        } else if (
+          identity.stepIndex !== undefined &&
+          (identity.span.name === "LLM" ||
+            identity.span.name === "LLM Subagent")
+        ) {
+          semanticSpanKey = `generation:${owningTurnKey}:${identity.stepIndex}`;
+        } else if (identity.callId !== undefined) {
+          semanticSpanKey = `tool:${owningTurnKey}:${identity.callId}`;
+        }
+
+        if (semanticSpanKey) {
+          stableSpanIds.set(
+            identity.spanId,
+            this.createStableCodexId(8, "span", semanticSpanKey),
+          );
+        }
+      }
+
+      for (const identity of traceSpans) {
+        identity.span.traceId = this.replaceOtelId(
+          identity.span.traceId,
+          traceId,
+        );
+
+        const stableSpanId = stableSpanIds.get(identity.spanId);
+        if (stableSpanId) {
+          identity.span.spanId = this.replaceOtelId(
+            identity.span.spanId,
+            stableSpanId,
+          );
+        }
+
+        if (identity.parentSpanId) {
+          const stableParentSpanId = stableSpanIds.get(identity.parentSpanId);
+          if (stableParentSpanId) {
+            identity.span.parentSpanId = this.replaceOtelId(
+              identity.span.parentSpanId,
+              stableParentSpanId,
+            );
+          }
+        }
+      }
+    }
+  }
+
+  private extractCodexIdentityAttribute(
+    span: CodexSpanIdentity["span"],
+    key: string,
+  ): string | undefined {
+    const attribute = span.attributes?.find((item) => item.key === key);
+    if (!attribute) return;
+
+    const value = this.convertValueToPlainJavascript(attribute.value);
+    if (typeof value === "string") return value || undefined;
+    if (typeof value === "number" || typeof value === "bigint") {
+      return String(value);
+    }
+  }
+
+  private findOwningCodexTurn(
+    identity: CodexSpanIdentity,
+    spansById: Map<string, CodexSpanIdentity>,
+  ): CodexSpanIdentity | undefined {
+    const visited = new Set<string>();
+    let current: CodexSpanIdentity | undefined = identity;
+
+    while (current && !visited.has(current.spanId)) {
+      visited.add(current.spanId);
+      if (current.turnId && current.threadId) return current;
+      current = current.parentSpanId
+        ? spansById.get(current.parentSpanId)
+        : undefined;
+    }
+  }
+
+  private codexTurnKey(threadId: string, turnId: string): string {
+    return JSON.stringify([threadId, turnId]);
+  }
+
+  private createStableCodexId(
+    byteLength: 8 | 16,
+    kind: "trace" | "span",
+    semanticKey: string,
+  ): Buffer {
+    return createHash("sha256")
+      .update(
+        JSON.stringify([
+          "langfuse-codex-dedup-v1",
+          this.projectId,
+          kind,
+          semanticKey,
+        ]),
+      )
+      .digest()
+      .subarray(0, byteLength);
+  }
+
+  private tryParseOtelId(value: OtelId | undefined): string | undefined {
+    if (!value) return;
+    if (typeof value === "string") return value;
+
+    try {
+      const data =
+        Buffer.isBuffer(value) || Array.isArray(value) ? value : value.data;
+      return data === undefined ? undefined : this.parseId(data);
+    } catch {
+      return;
+    }
+  }
+
+  private replaceOtelId<T extends OtelId | undefined>(
+    original: T,
+    replacement: Buffer,
+  ): T {
+    if (typeof original === "string") {
+      return replacement.toString("hex") as T;
+    }
+    if (original && !Buffer.isBuffer(original) && !Array.isArray(original)) {
+      original.data = Array.isArray(original.data)
+        ? [...replacement]
+        : Buffer.from(replacement);
+      return original;
+    }
+    return Buffer.from(replacement) as T;
+  }
+
+  /**
    * Uploads a batch of resourceSpans to blob storage and adds a job to process them
    * into the otel-ingestion-queue.
    */
@@ -384,6 +633,8 @@ export class OtelIngestionProcessor {
         if (resourceSpans.length === 0) {
           return [];
         }
+
+        this.normalizeCodexSpanIds(resourceSpans);
 
         const events = resourceSpans
           .filter((r) => Boolean(r))
@@ -743,13 +994,6 @@ export class OtelIngestionProcessor {
         );
 
         try {
-          // Lazy initialization - load seen traces from Redis if not already done
-          // Seen traces are traces that went through the ingestion pipeline within last 10 minutes
-          if (!this.isInitialized) {
-            this.seenTraces = await this.getSeenTracesSet(resourceSpans);
-            this.isInitialized = true;
-          }
-
           // Input validation
           if (!Array.isArray(resourceSpans)) {
             return [];
@@ -757,6 +1001,15 @@ export class OtelIngestionProcessor {
 
           if (resourceSpans.length === 0) {
             return [];
+          }
+
+          this.normalizeCodexSpanIds(resourceSpans);
+
+          // Lazy initialization - load seen traces from Redis if not already done
+          // Seen traces are traces that went through the ingestion pipeline within last 10 minutes
+          if (!this.isInitialized) {
+            this.seenTraces = await this.getSeenTracesSet(resourceSpans);
+            this.isInitialized = true;
           }
 
           // Process all events normally first
